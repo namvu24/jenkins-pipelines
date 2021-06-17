@@ -1,0 +1,86 @@
+pipeline {
+    agent none
+    parameters { booleanParam(name: 'START_VM', defaultValue: true, description: 'Set FALSE to start pipeline without VM start/stop') }
+    triggers { 
+        pollSCM('* */1 * * *')
+    }
+    stages {
+        stage('Start Worker VM') {
+            when {
+                expression { params.START_VM == true }
+            }
+            agent { 
+                label 'master'
+            }
+            steps { 
+                powershell "C:\\Users\\vm-workers\\vm-ondemand-start.ps1 -AllowedWorkers workers"
+            }
+        }
+        
+        stage('Build') {
+            agent {
+                label 'workers'
+            }
+            steps { 
+                bat """
+                    echo Restoring..
+                    \"C:\\jenkins\\.nuget\\nuget.exe\" restore \"${WORKSPACE}\\Project\\Project.sln\"
+                    echo Building..
+                    \"${tool 'MSBuild'}\" \"${WORKSPACE}\\Project\\Project.sln\" /t:Clean,Build /p:Configuration=Release /p:StyleCopEnabled=false
+                """
+            }
+        }
+
+        stage('Test') {
+            agent {
+                label 'workers'
+            }
+            steps {
+                bat """
+                    rm -rf \"${WORKSPACE}/Project/TestOutput\"
+                """
+                dir("Project/UnitTest/bin/Release") {
+                    bat """
+                        echo "Run unit testing for Conversion.."
+                        dotnet vstest Microsoft.PrivacyServices.Project.Conversions.UnitTest.dll /logger:trx;LogFileName=\"${WORKSPACE}/Project/TestOutput/ConversionTestOuput.trx\"
+                    """
+                }
+            }
+            post {
+                always {
+                    xunit (
+                        thresholds: [ failed(failureThreshold: '43') ],
+                        tools: [ MSTest(pattern: ' Project/TestOutput/*.trx') ]
+                    )
+                }
+            }
+        }
+
+        stage('Deploy') {
+            agent {
+                label 'workers'
+            }
+            steps { 
+                bat """
+                    echo Deploying..
+                    rm -rf C:\\Project
+                    mkdir C:\\Project
+                    xcopy \"${WORKSPACE}\\Project\\bin\\Release\" C:\\Project /s /e
+                """
+            }
+        }
+    }
+    post('Stop Worker VM') {        
+        always {
+            node('master') {
+                echo "param start_vm = ${START_VM}"
+                powershell '''
+                    echo "param start_vm = $env:START_VM"
+                    if ($env:START_VM) {
+                        &"C:\\Users\\vm-workers\\vm-ondemand-stop.ps1"
+                    }
+                '''
+            }
+        }
+    }
+}
